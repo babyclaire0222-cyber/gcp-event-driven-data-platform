@@ -71,7 +71,10 @@ assert b'webapp_http_requests_total' in u.urlopen('http://localhost:8080/metrics
         }
 
         stage('Deploy to GCP') {
-            when { expression { params.DEPLOY } }
+            when {
+                beforeInput true   // otherwise the approval prompt appears even when DEPLOY=false
+                expression { params.DEPLOY }
+            }
             // Asked before an agent is allocated, so nothing sits idle waiting for a human.
             input {
                 message 'Deploy the Cloud Function and Cloud Run service to GCP?'
