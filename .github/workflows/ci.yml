@@ -29,6 +29,16 @@ jobs:
       - name: Shell syntax
         run: for f in deployment/*.sh; do bash -n "$f"; done
 
+  monitoring-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: promtool check config + alert rules
+        run: |
+          docker run --rm -v "$PWD/monitoring/prometheus:/etc/prometheus:ro"             --entrypoint promtool prom/prometheus:v2.54.1 check config /etc/prometheus/prometheus.yml
+      - name: Grafana dashboard is valid JSON
+        run: python -m json.tool monitoring/grafana/dashboards/webapp.json > /dev/null
+
   docker-build:
     runs-on: ubuntu-latest
     steps:
@@ -38,5 +48,5 @@ jobs:
       - name: Smoke test
         run: |
           docker run -d --name app -p 8080:8080 -e GCP_PROJECT=ci -e BUCKET_NAME=ci webapp:ci
-          for i in $(seq 1 20); do curl -fsS localhost:8080/healthz && exit 0; sleep 1; done
+          for i in $(seq 1 20); do curl -fsS localhost:8080/healthz && curl -fsS localhost:8080/metrics | grep -q webapp_http_requests_total && exit 0; sleep 1; done
           docker logs app; exit 1

@@ -14,6 +14,8 @@ from functools import wraps
 
 from flask import g, jsonify, request
 
+import metrics
+
 
 class MemoryBackend:
     def __init__(self):
@@ -76,6 +78,7 @@ def rate_limit(limit: int | None = None, window: int | None = None):
         def wrapper(*args, **kwargs):
             allowed, retry_after = backend.hit(f"{fn.__name__}:{client_key()}", limit, window)
             if not allowed:
+                metrics.RATE_LIMITED.labels(request.url_rule.rule if request.url_rule else fn.__name__).inc()
                 resp = jsonify({"success": False, "error": "Rate limit exceeded. Try again later."})
                 resp.status_code = 429
                 resp.headers["Retry-After"] = str(retry_after)

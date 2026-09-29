@@ -15,8 +15,10 @@ from flask import Flask, g, jsonify, render_template, request, send_file
 from google.api_core.exceptions import NotFound
 from google.cloud import bigquery, storage
 
+import metrics
 from ratelimit import rate_limit
 from validation import (
+    ALLOWED_EXTENSIONS,
     HEAD_BYTES,
     MAX_UPLOAD_BYTES,
     ValidationError,
@@ -30,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES  # Flask returns 413 above this
+metrics.init_app(app)
 
 PROJECT_ID = os.environ.get("GCP_PROJECT", "")
 BUCKET_NAME = os.environ.get("BUCKET_NAME", "")
@@ -67,6 +70,8 @@ def add_security_headers(response):
 
 @app.errorhandler(413)
 def too_large(_):
+    # The body is never parsed (that is what raised 413), so the format is unknown.
+    metrics.UPLOADS.labels("unknown", "rejected_too_large").inc()
     mb = MAX_UPLOAD_BYTES // (1024 * 1024)
     return jsonify({"success": False, "error": f"File too large (max {mb} MB)"}), 413
 
@@ -99,6 +104,12 @@ def require_user(fn):
 # ===============================
 # Upload -> GCS (triggers the pipeline)
 # ===============================
+def _format_label(uploaded) -> str:
+    """Metric label for the upload's format; unknown extensions collapse to 'other'."""
+    ext = os.path.splitext(getattr(uploaded, "filename", "") or "")[1].lower()
+    return ext.lstrip(".") if ext in ALLOWED_EXTENSIONS else "other"
+
+
 CONTENT_TYPES = {
     ".csv": "text/csv",
     ".json": "application/x-ndjson",
@@ -117,6 +128,7 @@ def index():
     if uploaded is None:
         return jsonify({"success": False, "error": "No file uploaded"}), 400
 
+    fmt = _format_label(uploaded)
     try:
         table_name, ext = split_filename(uploaded.filename)
         head = uploaded.stream.read(HEAD_BYTES)
@@ -130,18 +142,28 @@ def index():
             data = uploaded.stream
     except ValidationError as e:
         logger.info("Rejected upload %r from %s: %s", uploaded.filename, g.user_email, e)
+        metrics.UPLOADS.labels(fmt, "rejected_validation").inc()
         return jsonify({"success": False, "error": str(e)}), 400
     except Exception:
         logger.exception("Could not read upload %r", uploaded.filename)
+        metrics.UPLOADS.labels(fmt, "rejected_validation").inc()
         return jsonify({"success": False, "error": "Could not read file"}), 400
 
-    blob = gcs().bucket(BUCKET_NAME).blob(f"{UPLOAD_PREFIX}{table_name}{ext}")
-    blob.metadata = {"uploaded-by": g.user_email, "original-name": uploaded.filename}
-    if isinstance(data, bytes):
-        blob.upload_from_string(data, content_type=CONTENT_TYPES[ext])
-    else:
-        blob.upload_from_file(data, content_type=CONTENT_TYPES[ext])
+    object_name = f"{UPLOAD_PREFIX}{table_name}{ext}"
+    try:
+        blob = gcs().bucket(BUCKET_NAME).blob(object_name)
+        blob.metadata = {"uploaded-by": g.user_email, "original-name": uploaded.filename}
+        if isinstance(data, bytes):
+            blob.upload_from_string(data, content_type=CONTENT_TYPES[ext])
+        else:
+            blob.upload_from_file(data, content_type=CONTENT_TYPES[ext])
+    except Exception:
+        logger.exception("GCS upload failed for gs://%s/%s", BUCKET_NAME, object_name)
+        metrics.UPLOADS.labels(fmt, "error").inc()
+        return jsonify({"success": False, "error": "Storage is unavailable; please retry."}), 502
     logger.info("Uploaded gs://%s/%s for %s", BUCKET_NAME, blob.name, g.user_email)
+    metrics.UPLOADS.labels(fmt, "accepted").inc()
+    metrics.UPLOAD_BYTES.observe(request.content_length or 0)
 
     return jsonify({
         "success": True,
@@ -325,7 +347,8 @@ def run_report():
     try:
         limit = min(max(int(data.get("limit") or 1000), 1), 10_000)
         sql = render_report_sql(report_id, data.get("table") or "")
-        result = bq().query(sql).result(max_results=limit)
+        with metrics.BQ_QUERY_LATENCY.labels(report_id).time():
+            result = bq().query(sql).result(max_results=limit)
     except (ValidationError, ValueError) as e:
         return jsonify({"success": False, "error": str(e)}), 400
     except NotFound:
