@@ -42,7 +42,7 @@
     <!-- Upload Section (enabled once /whoami returns 200) -->
     <div id="upload-section" class="dim" style="display:none;">
       <form id="uploadForm" method="POST" enctype="multipart/form-data">
-        <input type="file" name="file" required />
+        <input type="file" name="file" accept=".csv,.json,.parquet,.xlsx,.xls" required />
         <button type="submit">Upload & Analyze</button>
       </form>
 
@@ -151,6 +151,16 @@
       }
     })();
 
+    async function pollStatus(table, attempts = 30, delayMs = 2000) {
+      for (let i = 0; i < attempts; i++) {
+        await new Promise(r => setTimeout(r, delayMs));
+        const resp = await fetch(`/status/${encodeURIComponent(table)}`, { credentials: "include" });
+        const data = await resp.json().catch(() => ({}));
+        if (data.status && data.status !== "processing") return data;
+      }
+      return { status: "processing" };
+    }
+
     // File upload
     document.getElementById("uploadForm").onsubmit = async function(e) {
       e.preventDefault();
@@ -161,7 +171,7 @@
 
       messageDiv.style.display = "none";
       downloadDiv.style.display = "none";
-      showMsg(messageDiv, "⏳ Uploading file & processing in BigQuery...", true);
+      showMsg(messageDiv, "⏳ Uploading file...", true);
 
       try {
         const response = await fetch("/", { method: "POST", body: formData, credentials: "include" });
@@ -174,17 +184,21 @@
         }
 
         if (result && result.success) {
-          showMsg(messageDiv, "✅ " + (result.message || "Completed"), true);
-          if (result.table) {
-            // Prefill table fields in Reports & Looker sections
-            const t = result.table;
-            const reportTable = document.getElementById("report-table");
-            const lookerTable = document.getElementById("looker-table");
-            if (reportTable) reportTable.value = t;
-            if (lookerTable) lookerTable.value = t;
-
-            downloadUrl.href = `/download_bq?table=${encodeURIComponent(result.table)}`;
+          // Upload is accepted; the Pub/Sub -> Cloud Function pipeline loads it
+          // into BigQuery asynchronously, so poll until it lands or is rejected.
+          const t = result.table;
+          showMsg(messageDiv, "⏳ " + result.message, true);
+          const final = await pollStatus(t);
+          if (final.status === "loaded") {
+            showMsg(messageDiv, `✅ Loaded ${final.rows} rows into BigQuery table '${t}'`, true);
+            document.getElementById("report-table").value = t;
+            document.getElementById("looker-table").value = t;
+            downloadUrl.href = `/download_bq?table=${encodeURIComponent(t)}`;
             downloadDiv.style.display = "block";
+          } else if (final.status === "rejected") {
+            showMsg(messageDiv, "❌ Rejected by ingest: " + final.reason);
+          } else {
+            showMsg(messageDiv, "⌛ Still processing. Check again in a minute.", true);
           }
         } else {
           messageDiv.className = "message error";

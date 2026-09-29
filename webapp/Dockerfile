@@ -1,37 +1,20 @@
-# Use official Python slim image
-FROM python:3.9-slim
+FROM python:3.12-slim
 
-# Prevent Python from writing pyc files and enable stdout flushing
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PORT=8080
 
-# Default GCP environment variables (can be overridden in Cloud Run)
-ENV GCP_PROJECT=project-64f58cb2-a1cc-4618-9a0 \
-    BIGQUERY_DATASET=analysis_dataset \
-    BUCKET_NAME=project-64f58cb2-data-analysis \
-    PUBSUB_TOPIC_FOR_SQL_IMPORT=sql-import-topic \
-    FLASK_SECRET_KEY=change-this-in-production
-
-# Set working directory
 WORKDIR /app
 
-# Install system dependencies for Google Cloud Python libs
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    gcc \
-    libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy and install dependencies first (better caching)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir gunicorn
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application files
 COPY . .
 
-# IMPORTANT:
-#   The CMD must point to the Flask app object inside webapp/main.py
-#   'webapp.main:app' means "from webapp/main.py import app"
-#   Optimized for Cloud Run with multiple workers and threads
-CMD exec gunicorn --bind :$PORT --workers 4 --threads 2 --timeout 120 --keep-alive 2 --max-requests 1000 --max-requests-jitter 50 main:app
+# Run as non-root
+RUN useradd --create-home appuser
+USER appuser
+
+# Cloud Run sets $PORT. One process with threads: the app is I/O-bound (waits on GCP APIs), and a
+# single process keeps the in-memory rate limiter exact per instance when REDIS_URL is unset.
+CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --worker-class gthread --timeout 120 main:app

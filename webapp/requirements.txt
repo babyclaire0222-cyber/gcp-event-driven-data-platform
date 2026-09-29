@@ -1,18 +1,11 @@
-# Web framework
 Flask==3.0.3
-gunicorn==21.2.0
+gunicorn==23.0.0
+redis==5.0.8
 
-# Google Cloud libraries
 google-cloud-storage==2.16.0
-google-cloud-pubsub==2.21.5
 google-cloud-bigquery==3.25.0
-google-cloud-core>=2.4.1
 
-# gRPC + proto (needed by Pub/Sub & BigQuery)
-grpcio>=1.54.0
-protobuf>=4.25.0
-
-# Data handling
-pandas==2.2.2
-pyarrow==16.1.0
-openpyxl>=3.1.2
+# Excel -> CSV conversion
+pandas==2.2.3
+openpyxl==3.1.5
+xlrd==2.0.1
