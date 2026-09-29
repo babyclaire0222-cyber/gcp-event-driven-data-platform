@@ -17,6 +17,13 @@ flowchart LR
     CF -.->|"bad file + reason"| REJ[("GCS rejected/")]
     CR -->|"reports · Looker views · /status"| BQ
     BQ --> LS["Looker Studio"]
+
+    subgraph ops ["Observability + CI (Docker Compose / self-hosted)"]
+        PR["Prometheus<br/>scrape + alert rules"] --> GF["Grafana dashboard"]
+        JK["Jenkins pipeline"]
+    end
+    PR -.->|"scrape /metrics"| CR
+    JK -.->|"lint · test · build · gated deploy"| CR
 ```
 
 The web app never loads data itself. It writes the file to GCS and returns `202 Accepted`. Everything after that is event-driven. The UI polls `/status/<table>` until the table is `loaded` or `rejected`.
@@ -35,7 +42,11 @@ The web app never loads data itself. It writes the file to GCS and returns `202 
 | Docker Compose, local + prod | [`docker-compose.yml`](docker-compose.yml) (hot reload + Redis), [`docker-compose.prod.yml`](docker-compose.prod.yml) (Cloud Run image, read-only FS) |
 | Rate limiting (per user, Redis or in-memory) | [`webapp/ratelimit.py`](webapp/ratelimit.py) |
 | Input validation (two layers) | [`webapp/validation.py`](webapp/validation.py), [`functions/ingest/main.py`](functions/ingest/main.py) (`parse_object_name`, `reject`) |
-| Tests + CI (lint, 54 unit tests, Docker build + smoke test) | [`tests/`](tests), [`.github/workflows/ci.yml`](.github/workflows/ci.yml) |
+| Prometheus metrics: request latency, upload outcomes, 429s, BigQuery query time | [`webapp/metrics.py`](webapp/metrics.py), [`monitoring/prometheus/prometheus.yml`](monitoring/prometheus/prometheus.yml) |
+| Prometheus alert rules: web app down, high rejection rate, p95 latency, rate-limit spike | [`monitoring/prometheus/alerts.yml`](monitoring/prometheus/alerts.yml) |
+| Grafana dashboard, provisioned as code (11 panels) | [`monitoring/grafana/`](monitoring/grafana), [`docker-compose.monitoring.yml`](docker-compose.monitoring.yml) |
+| Jenkins pipeline: lint, tests with JUnit report, alert-rule check, image build, smoke test, manual-approval deploy | [`Jenkinsfile`](Jenkinsfile), [`jenkins/`](jenkins) (plugins + job defined in Configuration-as-Code), [`docker-compose.jenkins.yml`](docker-compose.jenkins.yml) |
+| Tests + GitHub Actions CI (lint, 59 unit tests, promtool, Docker build + smoke test) | [`tests/`](tests), [`.github/workflows/ci.yml`](.github/workflows/ci.yml) |
 
 ## Design decisions
 
@@ -50,6 +61,8 @@ The web app never loads data itself. It writes the file to GCS and returns `202 
 
   The function validates again, because anything with bucket access can write to `uploads/`. If a file can *never* load (bad name, empty, or a BigQuery parse error with `max_bad_records=0`), the function moves it to `rejected/`, records the reason in object metadata, and acks the message so it isn't retried forever. Transient errors are raised instead, so Pub/Sub retries them.
 - **Rate limiting is keyed on identity, not IP.** Limits are per IAP-authenticated email, because `X-Forwarded-For` is set by the client and easy to spoof (see `test_spoofed_forwarded_for_does_not_reset_limit`). With `REDIS_URL` set, a fixed-window counter in Redis (`INCR` + `EXPIRE`) is shared by every process. Without Redis, each process keeps a sliding-window log in memory, and gunicorn runs as one process with 8 threads so that limit is exact per instance. Over-limit requests get `429` with a `Retry-After` header.
+- **Metrics are built to stay low-cardinality.** The `endpoint` label is the route template (`/status/<table>`, not `/status/sales`), and `format`/`outcome` come from fixed sets, with unknown extensions collapsed to `other`. Uploading thousands of differently named files can't create thousands of time series. Because gunicorn runs a single process, the default Prometheus registry is accurate without multiprocess mode. Failed GCS writes are counted as `outcome="error"` and return `502`, so storage outages show up on the dashboard instead of as anonymous 500s.
+- **Two CI systems, one set of checks.** GitHub Actions gives the public badge on every push. The Jenkinsfile runs the same stages on a self-hosted server and adds a deploy stage behind an `input` approval with GCP credentials from the Jenkins credential store. `beforeInput true` means the approval prompt only appears when `DEPLOY=true`. The local Jenkins has no setup wizard or UI clicks: plugins are baked into the image, and Configuration-as-Code creates the admin user and the pipeline job.
 - **SQL injection is prevented, not escaped.** Table names must match `^[a-zA-Z_][a-zA-Z0-9_]{0,127}$` before they reach any query. Report column names are read from the table's BigQuery schema, never from the request.
 
 ## Run locally
@@ -69,6 +82,23 @@ To run the exact image Cloud Run uses (gunicorn, non-root, read-only filesystem)
 ```bash
 docker compose -f docker-compose.prod.yml up --build
 ```
+
+**Monitoring.** Add the overlay to either stack, then generate some traffic:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up --build
+python scripts/generate_traffic.py --minutes 3
+```
+
+Grafana at http://localhost:3000 (the *Webapp overview* dashboard is the home page; anonymous read-only, or admin/admin). Prometheus at http://localhost:9090 (see *Alerts* for the 4 rules).
+
+**Jenkins.** The pipeline job is created automatically and polls `master` every 5 minutes:
+
+```bash
+docker compose -f docker-compose.jenkins.yml up -d --build   # http://localhost:8081, admin/admin
+```
+
+To use the gated deploy stage, add two credentials in Jenkins: `gcp-sa-key` (secret file, a deployer service-account key) and `gcp-project-id` (secret text). Then run *Build with Parameters* with `DEPLOY` checked.
 
 Tests don't need GCP:
 
@@ -134,11 +164,21 @@ This deletes the Cloud Run service, the function (and its Eventarc trigger), the
 
 ![BigQuery query result](docs/screenshots/bigquery-query.png)
 
+**Grafana**, the *Webapp overview* dashboard during `generate_traffic.py`:
+
+![Grafana dashboard](docs/screenshots/grafana-dashboard.png)
+
+**Jenkins**, the pipeline stage view:
+
+![Jenkins pipeline](docs/screenshots/jenkins-pipeline.png)
+
 ## What I'd do next
 
 1. **Shared rate limiting in production.** The deployed Cloud Run service has no Redis, so limits apply per instance. With `--max-instances=3`, one user could in theory make 3× the configured limit. The fix is to point `REDIS_URL` at Memorystore through a VPC connector, which I skipped to keep the demo under $1/month.
 2. **Verify the IAP JWT in the app.** The app trusts `X-Goog-Authenticated-User-Email` because the service only accepts traffic through IAP. Checking the signed `X-Goog-IAP-JWT-Assertion` would protect against a future misconfiguration, such as someone adding `--allow-unauthenticated`.
-3. **Operational hardening.** Items still missing:
-   - a dead-letter topic and alerting for messages that keep failing
+3. **Production observability and hardening.** Items still missing:
+   - Prometheus and Grafana run with Docker Compose only; nothing scrapes the deployed Cloud Run service yet. The next step is Google Cloud Managed Service for Prometheus with a Cloud Run sidecar, and Alertmanager routing to email or Slack (right now the rules only show in the Prometheus UI).
+   - The ingest function has no Prometheus metrics; its health is visible only in Cloud Logging.
+   - a dead-letter topic for messages that keep failing
    - schema-drift checks, since `WRITE_TRUNCATE` means a re-upload silently replaces the table
    - Workload Identity Federation for the deploy workflow instead of a JSON service-account key
