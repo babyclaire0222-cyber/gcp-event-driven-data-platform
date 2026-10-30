@@ -1,6 +1,30 @@
 import pytest
 
-from validation import ValidationError, split_filename, validate_content, validate_table_name
+from validation import ValidationError, split_filename, txt_to_csv, validate_content, validate_table_name
+
+
+@pytest.mark.parametrize("raw", [
+    b"dept,amount\nIT,10\n",
+    b"dept\tamount\nIT\t10\n",
+    b"dept|amount\nIT|10\n",
+    b"\xef\xbb\xbfdept,amount\r\nIT,10\r\n\r\n",  # Notepad: BOM, CRLF, trailing blank line
+])
+def test_txt_tables_convert_to_csv(raw):
+    validate_content(raw, ".txt")
+    assert txt_to_csv(raw).decode().split() == ["dept,amount", "IT,10"]
+
+
+@pytest.mark.parametrize("raw,msg", [
+    (b"Remember to send the budget to finance on Friday.\nAlso book the room.\n", "must be a table"),
+    (b"dept,amount\n", "must be a table"),  # header only
+    (b"a,b\n1,2\n3\n", "must be a table"),  # uneven rows
+    (b"a,,c\n1,2,3\n", "empty column"),
+    (b"a,A\n1,2\n", "duplicate"),
+    (b"\xff\xfea\x00,\x00b\x00", "UTF-8"),  # Notepad's "UTF-16" encoding
+])
+def test_txt_rejects_non_tables(raw, msg):
+    with pytest.raises(ValidationError, match=msg):
+        validate_content(raw, ".txt")
 
 
 @pytest.mark.parametrize("name", ["sales", "finance_2024", "_staging", "A" * 128])

@@ -132,3 +132,17 @@ def test_excel_is_converted_to_csv_before_gcs(client, gcs):
     gcs.bucket().blob.assert_called_with("uploads/budget.csv")
     data = gcs.bucket().blob().upload_from_string.call_args.args[0]
     assert data.decode().splitlines() == ["department,amount", "IT,10"]
+
+
+def test_txt_is_converted_to_csv_before_gcs(client, gcs):
+    r = upload(client, "budget.txt", b"department\tamount\nIT\t10\n")
+    assert r.status_code == 202
+    gcs.bucket().blob.assert_called_with("uploads/budget.csv")
+    data = gcs.bucket().blob().upload_from_string.call_args.args[0]
+    assert data.decode().split() == ["department,amount", "IT,10"]
+
+
+def test_free_form_txt_is_rejected_before_gcs(client, gcs):
+    r = upload(client, "notes.txt", b"Just some meeting notes.\nNothing tabular here.\n")
+    assert r.status_code == 400 and "must be a table" in r.json["error"]
+    gcs.bucket().blob().upload_from_string.assert_not_called()

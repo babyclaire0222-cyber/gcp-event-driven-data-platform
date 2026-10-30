@@ -23,6 +23,7 @@ from validation import (
     MAX_UPLOAD_BYTES,
     ValidationError,
     split_filename,
+    txt_to_csv,
     validate_content,
     validate_table_name,
 )
@@ -137,6 +138,9 @@ def index():
         if ext in (".xlsx", ".xls"):
             # Convert Excel here so the ingest function only handles BigQuery-native formats.
             data = pd.read_excel(uploaded.stream).to_csv(index=False).encode("utf-8")
+            ext = ".csv"
+        elif ext == ".txt":
+            data = txt_to_csv(uploaded.stream.read())
             ext = ".csv"
         else:
             data = uploaded.stream

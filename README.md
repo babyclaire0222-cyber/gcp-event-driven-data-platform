@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/babyclaire0222-cyber/gcp-event-driven-data-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/babyclaire0222-cyber/gcp-event-driven-data-platform/actions/workflows/ci.yml)
 
-A serverless GCP pipeline for finance and ops analysts. Upload a CSV, JSON, Parquet or Excel file, and it's validated, loaded into BigQuery through Pub/Sub and Cloud Functions, and available as Looker Studio dashboards within seconds. No data engineer needed.
+A serverless GCP pipeline for finance and ops analysts. Upload a CSV, JSON, Parquet, Excel or delimited text file, and it's validated, loaded into BigQuery through Pub/Sub and Cloud Functions, and available as Looker Studio dashboards within seconds. No data engineer needed.
 
 ## Architecture
 
@@ -32,7 +32,7 @@ The web app never loads data itself. It writes the file to GCS and returns `202 
 
 | Capability | Where it's implemented |
 |---|---|
-| Multi-format ingest: CSV, newline-delimited JSON, Parquet, Excel (.xlsx/.xls, converted to CSV) | [`webapp/validation.py`](webapp/validation.py) (`ALLOWED_EXTENSIONS`), [`webapp/main.py`](webapp/main.py) (`index`), [`functions/ingest/main.py`](functions/ingest/main.py) (`SOURCE_FORMATS`) |
+| Multi-format ingest: CSV, newline-delimited JSON, Parquet, Excel (.xlsx/.xls) and delimited text (.txt with comma, tab or `|`), both converted to CSV | [`webapp/validation.py`](webapp/validation.py) (`ALLOWED_EXTENSIONS`), [`webapp/main.py`](webapp/main.py) (`index`), [`functions/ingest/main.py`](functions/ingest/main.py) (`SOURCE_FORMATS`) |
 | Cloud Storage landing zone with 30-day lifecycle | [`webapp/main.py`](webapp/main.py) (`index`), [`deployment/create_resources.sh`](deployment/create_resources.sh) step 2 |
 | Pub/Sub: GCS notification → topic | [`deployment/create_resources.sh`](deployment/create_resources.sh) step 4 |
 | Cloud Functions (gen2) Pub/Sub trigger | [`functions/ingest/main.py`](functions/ingest/main.py) (`ingest`), [`deployment/deploy.sh`](deployment/deploy.sh) (`--trigger-topic --retry`) |
@@ -46,7 +46,7 @@ The web app never loads data itself. It writes the file to GCS and returns `202 
 | Prometheus alert rules: web app down, high rejection rate, p95 latency, rate-limit spike | [`monitoring/prometheus/alerts.yml`](monitoring/prometheus/alerts.yml) |
 | Grafana dashboard, provisioned as code (11 panels) | [`monitoring/grafana/`](monitoring/grafana), [`docker-compose.monitoring.yml`](docker-compose.monitoring.yml) |
 | Jenkins pipeline: lint, tests with JUnit report, alert-rule check, image build, smoke test, manual-approval deploy | [`Jenkinsfile`](Jenkinsfile), [`jenkins/`](jenkins) (plugins + job defined in Configuration-as-Code), [`docker-compose.jenkins.yml`](docker-compose.jenkins.yml) |
-| Tests + GitHub Actions CI (lint, 59 unit tests, promtool, Docker build + smoke test) | [`tests/`](tests), [`.github/workflows/ci.yml`](.github/workflows/ci.yml) |
+| Tests + GitHub Actions CI (lint, 71 unit tests, promtool, Docker build + smoke test) | [`tests/`](tests), [`.github/workflows/ci.yml`](.github/workflows/ci.yml) |
 
 ## Design decisions
 
@@ -58,6 +58,7 @@ The web app never loads data itself. It writes the file to GCS and returns `202 
   - magic-byte checks (a CSV renamed to `.parquet` fails)
   - a CSV header check (≥ 2 named, unique columns)
   - a newline-delimited JSON check
+  - a table check for `.txt` (header, data rows, same column count on every line), so free-form notes are refused
 
   The function validates again, because anything with bucket access can write to `uploads/`. If a file can *never* load (bad name, empty, or a BigQuery parse error with `max_bad_records=0`), the function moves it to `rejected/`, records the reason in object metadata, and acks the message so it isn't retried forever. Transient errors are raised instead, so Pub/Sub retries them.
 - **Rate limiting is keyed on identity, not IP.** Limits are per IAP-authenticated email, because `X-Forwarded-For` is set by the client and easy to spoof (see `test_spoofed_forwarded_for_does_not_reset_limit`). With `REDIS_URL` set, a fixed-window counter in Redis (`INCR` + `EXPIRE`) is shared by every process. Without Redis, each process keeps a sliding-window log in memory, and gunicorn runs as one process with 8 threads so that limit is exact per instance. Over-limit requests get `429` with a `Retry-After` header.
