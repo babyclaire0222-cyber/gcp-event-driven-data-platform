@@ -1,0 +1,41 @@
+groups:
+  - name: webapp
+    rules:
+      - alert: WebappDown
+        expr: up{job="webapp"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "webapp /metrics has been unreachable for 1 minute"
+
+      - alert: HighUploadRejectionRate
+        # More than half of uploads rejected, ignoring quiet periods (< 5 uploads).
+        expr: |
+          (
+            sum(increase(webapp_uploads_total{outcome=~"rejected.*"}[15m]))
+            / sum(increase(webapp_uploads_total[15m]))
+          ) > 0.5
+          and sum(increase(webapp_uploads_total[15m])) >= 5
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of uploads rejected in the last 15m"
+          description: "Check webapp logs for the validation errors; a client may be sending a broken format."
+
+      - alert: HighReadLatencyP95
+        # Excludes "/" (uploads are legitimately slow for large files).
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(webapp_http_request_duration_seconds_bucket{endpoint!~"/|/metrics"}[5m]))
+          ) > 2
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "p95 latency for read endpoints is {{ $value | humanizeDuration }}"
+
+      - alert: RateLimitSpike
+        expr: sum(rate(webapp_rate_limited_total[5m])) > 0.2
+        for: 5m
+        labels: {severity: info}
+        annotations:
+          summary: "More than 1 request in 5s is being rate limited; limits may be too tight or a client is misbehaving"

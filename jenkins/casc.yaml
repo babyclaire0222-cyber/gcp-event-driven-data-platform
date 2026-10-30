@@ -1,0 +1,40 @@
+jenkins:
+  systemMessage: "CI for gcp-event-driven-data-platform (configured by jenkins/casc.yaml)"
+  numExecutors: 2
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: admin
+          password: "${JENKINS_ADMIN_PASSWORD}"
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: false
+
+unclassified:
+  location:
+    url: "http://localhost:8081/"
+
+jobs:
+  - script: |
+      pipelineJob('gcp-event-driven-data-platform') {
+        description('Lint, unit tests, alert-rule check, Docker build, smoke test, optional gated deploy. See Jenkinsfile.')
+        properties {
+          pipelineTriggers {
+            triggers {
+              pollSCM { scmpoll_spec('H/5 * * * *') }
+            }
+          }
+        }
+        definition {
+          cpsScm {
+            scm {
+              git {
+                remote { url('${REPO_URL}') }
+                branch('*/${REPO_BRANCH}')
+              }
+            }
+            scriptPath('Jenkinsfile')
+          }
+        }
+      }

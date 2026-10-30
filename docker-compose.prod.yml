@@ -1,0 +1,25 @@
+# Production-like run: the same image Cloud Run deploys (gunicorn, no reload,
+# no source mount, non-root). Use it to smoke-test the image before deploying.
+#
+#   docker compose -f docker-compose.prod.yml up --build
+services:
+  webapp:
+    build: ./webapp
+    ports:
+      - "8080:8080"
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      GOOGLE_APPLICATION_CREDENTIALS: /gcloud/application_default_credentials.json
+    volumes:
+      - ${GCLOUD_CONFIG_DIR:-~/.config/gcloud}:/gcloud:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped

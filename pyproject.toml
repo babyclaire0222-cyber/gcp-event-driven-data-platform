@@ -1,0 +1,18 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "S", "UP"]
+ignore = [
+    "S101",  # assert is fine in tests
+    "S104",  # binding 0.0.0.0 is required inside containers
+    "S608",  # SQL built from validated identifiers only; see validation.py
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["validation", "ratelimit", "metrics", "conftest"]

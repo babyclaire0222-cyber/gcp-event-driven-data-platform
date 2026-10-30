@@ -1,312 +1,314 @@
-from flask import Flask, request, render_template, send_file, jsonify, g
-import os
-import json
-import csv
-import pandas as pd
-import logging
-import time
-from functools import wraps
-from google.cloud import storage, bigquery
-from google.cloud import pubsub_v1
-import re
-import io
-from google.api_core.exceptions import NotFound
+"""Cloud Run app layer: authenticated upload to GCS, reports and Looker views over BigQuery.
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+Ingestion is event-driven and does NOT happen here: this app writes the file to
+gs://$BUCKET_NAME/uploads/, a GCS notification publishes to Pub/Sub, and the
+`ingest` Cloud Function loads it into BigQuery (see functions/ingest/main.py).
+"""
+import csv
+import io
+import logging
+import os
+from functools import lru_cache, wraps
+
+import pandas as pd
+from flask import Flask, g, jsonify, render_template, request, send_file
+from google.api_core.exceptions import NotFound
+from google.cloud import bigquery, storage
+
+import metrics
+from ratelimit import rate_limit
+from validation import (
+    ALLOWED_EXTENSIONS,
+    HEAD_BYTES,
+    MAX_UPLOAD_BYTES,
+    ValidationError,
+    split_filename,
+    txt_to_csv,
+    validate_content,
+    validate_table_name,
+)
+
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'dev-secret-change-in-production')  # Use environment variable in production
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES  # Flask returns 413 above this
+metrics.init_app(app)
+
+PROJECT_ID = os.environ.get("GCP_PROJECT", "")
+BUCKET_NAME = os.environ.get("BUCKET_NAME", "")
+BIGQUERY_DATASET = os.environ.get("BIGQUERY_DATASET", "analysis_dataset")
+UPLOAD_PREFIX = "uploads/"
+REJECTED_PREFIX = "rejected/"
+
+
+# Clients are created on first use so the app (and tests) can import without credentials.
+@lru_cache(maxsize=1)
+def gcs() -> storage.Client:
+    return storage.Client(project=PROJECT_ID or None)
+
+
+@lru_cache(maxsize=1)
+def bq() -> bigquery.Client:
+    return bigquery.Client(project=PROJECT_ID or None)
+
 
 # ===============================
-# 🔹 Security Middleware
+# Security headers
 # ===============================
 @app.after_request
 def add_security_headers(response):
-    """Add security headers to all responses."""
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    response.headers['X-Frame-Options'] = 'DENY'
-    response.headers['X-XSS-Protection'] = '1; mode=block'
-    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
-    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
-    response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self'"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'"
+    )
     return response
 
-# Simple rate limiting (in production, use Redis or Cloud Memorystore)
-rate_limit_storage = {}
 
-def rate_limit(max_requests=10, window_seconds=60):
-    """Simple rate limiting decorator."""
-    def decorator(f):
-        @wraps(f)
-        def decorated_function(*args, **kwargs):
-            client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-            now = time.time()
-            
-            # Clean old entries
-            rate_limit_storage[client_ip] = [
-                req_time for req_time in rate_limit_storage.get(client_ip, [])
-                if now - req_time < window_seconds
-            ]
-            
-            # Check rate limit
-            if len(rate_limit_storage[client_ip]) >= max_requests:
-                logger.warning(f"Rate limit exceeded for IP: {client_ip}")
-                return jsonify({"error": "Rate limit exceeded. Please try again later."}), 429
-            
-            # Add current request
-            rate_limit_storage.setdefault(client_ip, []).append(now)
-            
-            return f(*args, **kwargs)
-        return decorated_function
-    return decorator
+@app.errorhandler(413)
+def too_large(_):
+    # The body is never parsed (that is what raised 413), so the format is unknown.
+    metrics.UPLOADS.labels("unknown", "rejected_too_large").inc()
+    mb = MAX_UPLOAD_BYTES // (1024 * 1024)
+    return jsonify({"success": False, "error": f"File too large (max {mb} MB)"}), 413
+
 
 # ===============================
-# 🔹 IAP-only auth helpers
+# IAP auth
 # ===============================
 @app.before_request
 def read_iap_identity():
-    """
-    When traffic comes through IAP, Google injects:
-      X-Goog-Authenticated-User-Email: "accounts.google.com:<email>"
-    """
-    raw = request.headers.get("X-Goog-Authenticated-User-Email", "") or ""
+    """Cloud Run is deployed with --iap and --no-allow-unauthenticated, so every
+    request has passed IAP, which sets X-Goog-Authenticated-User-Email."""
+    raw = request.headers.get("X-Goog-Authenticated-User-Email", "")
     g.user_email = raw.split(":", 1)[1] if raw.startswith("accounts.google.com:") else None
+    # Local docker-compose has no IAP in front. K_SERVICE is set by Cloud Run,
+    # so this override can never apply to a deployed service.
+    if g.user_email is None and not os.environ.get("K_SERVICE"):
+        g.user_email = os.environ.get("DEV_USER_EMAIL") or None
 
-def current_user_email():
-    """Return the IAP-authenticated email, or None."""
-    return getattr(g, "user_email", None)
 
 def require_user(fn):
-    """Decorator that ensures the request passed IAP."""
     @wraps(fn)
-    def _wrap(*args, **kwargs):
-        email = current_user_email()
-        if not email:
+    def wrapper(*args, **kwargs):
+        if not g.user_email:
             return jsonify({"success": False, "error": "Unauthorized"}), 401
         return fn(*args, **kwargs)
-    return _wrap
+
+    return wrapper
+
 
 # ===============================
-# 🔹 GCP Configuration
+# Upload -> GCS (triggers the pipeline)
 # ===============================
-PROJECT_ID = os.environ.get('GCP_PROJECT', 'project-64f58cb2-a1cc-4618-9a0')
-BUCKET_NAME = os.environ.get('BUCKET_NAME', 'project-64f58cb2-data-analysis')
-PUBSUB_TOPIC_FOR_SQL_IMPORT = os.environ.get('PUBSUB_TOPIC_FOR_SQL_IMPORT', 'sql-import-topic')
-BIGQUERY_DATASET = os.environ.get('BIGQUERY_DATASET', 'analysis_dataset')
+def _format_label(uploaded) -> str:
+    """Metric label for the upload's format; unknown extensions collapse to 'other'."""
+    ext = os.path.splitext(getattr(uploaded, "filename", "") or "")[1].lower()
+    return ext.lstrip(".") if ext in ALLOWED_EXTENSIONS else "other"
 
-# Clients
-storage_client = storage.Client()
-bq_client = bigquery.Client()
-publisher = pubsub_v1.PublisherClient()
-topic_path = publisher.topic_path(PROJECT_ID, PUBSUB_TOPIC_FOR_SQL_IMPORT)
 
-# ===============================
-# 🔹 Helper functions
-# ===============================
-def validate_table_name(table_name):
-    """Strict table name validation to prevent SQL injection."""
-    if not table_name:
-        raise ValueError("Table name cannot be empty")
-    
-    # Only allow alphanumeric characters and underscores
-    if not re.match(r'^[a-zA-Z0-9_]{1,128}$', table_name):
-        raise ValueError("Invalid table name. Only letters, numbers, and underscores allowed (max 128 chars)")
-    
-    # Prevent SQL keywords
-    sql_keywords = {'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'DROP', 'CREATE', 'ALTER', 'EXEC', 'UNION', 'WHERE', 'JOIN'}
-    if table_name.upper() in sql_keywords:
-        raise ValueError("Table name cannot be a SQL keyword")
-    
-    return table_name
+CONTENT_TYPES = {
+    ".csv": "text/csv",
+    ".json": "application/x-ndjson",
+    ".parquet": "application/vnd.apache.parquet",
+}
 
-def ensure_dataset_exists(dataset_id):
-    """Create dataset if it doesn't already exist."""
-    dataset_ref = bq_client.dataset(dataset_id)
+
+@app.route("/", methods=["GET", "POST"])
+@require_user
+@rate_limit()
+def index():
+    if request.method == "GET":
+        return render_template("index.html")
+
+    uploaded = request.files.get("file")
+    if uploaded is None:
+        return jsonify({"success": False, "error": "No file uploaded"}), 400
+
+    fmt = _format_label(uploaded)
     try:
-        bq_client.get_dataset(dataset_ref)
+        table_name, ext = split_filename(uploaded.filename)
+        head = uploaded.stream.read(HEAD_BYTES)
+        uploaded.stream.seek(0)
+        validate_content(head, ext)
+        if ext in (".xlsx", ".xls"):
+            # Convert Excel here so the ingest function only handles BigQuery-native formats.
+            data = pd.read_excel(uploaded.stream).to_csv(index=False).encode("utf-8")
+            ext = ".csv"
+        elif ext == ".txt":
+            data = txt_to_csv(uploaded.stream.read())
+            ext = ".csv"
+        else:
+            data = uploaded.stream
+    except ValidationError as e:
+        logger.info("Rejected upload %r from %s: %s", uploaded.filename, g.user_email, e)
+        metrics.UPLOADS.labels(fmt, "rejected_validation").inc()
+        return jsonify({"success": False, "error": str(e)}), 400
     except Exception:
-        dataset = bigquery.Dataset(dataset_ref)
-        dataset.location = "asia-southeast1"  # Match your region
-        bq_client.create_dataset(dataset)
+        logger.exception("Could not read upload %r", uploaded.filename)
+        metrics.UPLOADS.labels(fmt, "rejected_validation").inc()
+        return jsonify({"success": False, "error": "Could not read file"}), 400
 
-def load_to_bigquery(file_path, filename, table_name):
-    """Loads supported file types into BigQuery with autodetect schema."""
-    ensure_dataset_exists(BIGQUERY_DATASET)
+    object_name = f"{UPLOAD_PREFIX}{table_name}{ext}"
+    try:
+        blob = gcs().bucket(BUCKET_NAME).blob(object_name)
+        blob.metadata = {"uploaded-by": g.user_email, "original-name": uploaded.filename}
+        if isinstance(data, bytes):
+            blob.upload_from_string(data, content_type=CONTENT_TYPES[ext])
+        else:
+            blob.upload_from_file(data, content_type=CONTENT_TYPES[ext])
+    except Exception:
+        logger.exception("GCS upload failed for gs://%s/%s", BUCKET_NAME, object_name)
+        metrics.UPLOADS.labels(fmt, "error").inc()
+        return jsonify({"success": False, "error": "Storage is unavailable; please retry."}), 502
+    logger.info("Uploaded gs://%s/%s for %s", BUCKET_NAME, blob.name, g.user_email)
+    metrics.UPLOADS.labels(fmt, "accepted").inc()
+    metrics.UPLOAD_BYTES.observe(request.content_length or 0)
 
-    ext = os.path.splitext(filename)[1].lower()
-    tmp_path = file_path
+    return jsonify({
+        "success": True,
+        "status": "processing",
+        "message": f"Uploaded {uploaded.filename}; loading into BigQuery table '{table_name}'",
+        "table": table_name,
+    }), 202
 
-    # Convert Excel to CSV before loading
-    if ext in [".xls", ".xlsx"]:
-        df = pd.read_excel(file_path)
-        tmp_path = f"/tmp/{table_name}.csv"
-        df.to_csv(tmp_path, index=False)
-        source_format = bigquery.SourceFormat.CSV
-        skip_rows = 1
-    elif ext == ".csv":
-        source_format = bigquery.SourceFormat.CSV
-        skip_rows = 1
-    elif ext == ".json":
-        source_format = bigquery.SourceFormat.NEWLINE_DELIMITED_JSON
-        skip_rows = 0
-    elif ext == ".parquet":
-        source_format = bigquery.SourceFormat.PARQUET
-        skip_rows = 0
-    else:
-        raise ValueError("Unsupported file type. Use CSV, Excel, JSON, or Parquet.")
 
-    # Upload to GCS
-    bucket = storage_client.bucket(BUCKET_NAME)
-    blob = bucket.blob(f"uploads/{filename}")
-    blob.upload_from_filename(tmp_path)
-
-    # Load into BigQuery
-    table_id = f"{PROJECT_ID}.{BIGQUERY_DATASET}.{table_name}"
-    job_config = bigquery.LoadJobConfig(
-        autodetect=True,
-        source_format=source_format,
-        skip_leading_rows=skip_rows,
-        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-    )
-
-    with open(tmp_path, "rb") as source_file:
-        load_job = bq_client.load_table_from_file(source_file, table_id, job_config=job_config)
-
-    load_job.result()
-
-def run_analysis(table_name):
-    """Runs a fresh analysis query, saves results to GCS and BigQuery."""
-    ensure_dataset_exists(BIGQUERY_DATASET)
+@app.route("/status/<table>")
+@require_user
+def status(table):
+    """Poll ingestion result: loaded (table exists), rejected, or processing."""
+    try:
+        table = validate_table_name(table)
+    except ValidationError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
 
     try:
-        bq_client.get_table(f"{PROJECT_ID}.{BIGQUERY_DATASET}.{table_name}")
-    except Exception:
-        raise ValueError(f"BigQuery table {table_name} not found.")
+        t = bq().get_table(f"{PROJECT_ID}.{BIGQUERY_DATASET}.{table}")
+        return jsonify({"success": True, "status": "loaded", "rows": t.num_rows})
+    except NotFound:
+        pass
 
-    query = f"SELECT * FROM `{PROJECT_ID}.{BIGQUERY_DATASET}.{table_name}` LIMIT 10"
-    results = bq_client.query(query).result()
+    for blob in gcs().list_blobs(BUCKET_NAME, prefix=f"{REJECTED_PREFIX}{table}."):
+        reason = (blob.metadata or {}).get("rejection-reason", "rejected by ingest")
+        return jsonify({"success": True, "status": "rejected", "reason": reason})
 
-    local_csv = f"/tmp/{table_name}_results.csv"
-    with open(local_csv, "w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.writer(csvfile)
-        headers = [field.name for field in results.schema]
-        writer.writerow(headers)
-        for row in results:
-            writer.writerow(list(row.values()))
+    return jsonify({"success": True, "status": "processing"})
 
-    # Upload to GCS
-    bucket = storage_client.bucket(BUCKET_NAME)
-    blob = bucket.blob(f"analysis_results/{table_name}_results.csv")
-    blob.upload_from_filename(local_csv)
 
-    # Save to BigQuery _analysis table
-    destination_table = f"{PROJECT_ID}.{BIGQUERY_DATASET}.{table_name}_analysis"
-    job_config = bigquery.QueryJobConfig(
-        destination=destination_table,
-        write_disposition="WRITE_TRUNCATE"
-    )
-    bq_client.query(query, job_config=job_config).result()
+def _csv_response(result, filename: str):
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow([f.name for f in result.schema])
+    for row in result:
+        writer.writerow(list(row.values()))
+    return send_file(io.BytesIO(out.getvalue().encode("utf-8")), mimetype="text/csv",
+                     as_attachment=True, download_name=filename)
 
-    return table_name
+
+@app.route("/download_bq")
+@require_user
+@rate_limit()
+def download_bq():
+    """Export a loaded table as CSV (capped at 10k rows)."""
+    try:
+        table = validate_table_name(request.args.get("table", ""))
+        rows = bq().list_rows(f"{PROJECT_ID}.{BIGQUERY_DATASET}.{table}", max_results=10_000)
+        return _csv_response(rows, f"{table}.csv")
+    except ValidationError as e:
+        return str(e), 400
+    except NotFound:
+        return "Table not found (still processing?)", 404
+
+
+@app.route("/whoami")
+@require_user
+def whoami():
+    return jsonify({"success": True, "email": g.user_email})
+
+
+@app.route("/healthz")
+def healthz():
+    return "ok", 200
+
 
 # ===============================
-# 🔹 Auto-detect finance column names
+# Finance reports (templated BigQuery SQL)
 # ===============================
-def _fq_table(table_name: str) -> str:
-    """Return fully-qualified table id, after validating a safe table name."""
-    validated_name = validate_table_name(table_name)
-    return f"{PROJECT_ID}.{BIGQUERY_DATASET}.{validated_name}"
-
-def _table_schema_cols(table_fq: str):
-    """Return dict {lower_col_name: (original_name, field)}."""
-    tbl = bq_client.get_table(table_fq)
-    out = {}
-    for f in tbl.schema:
-        out[f.name.lower()] = (f.name, f)
-    return out
-
 def _pick_column(cols: dict, candidates, required=True):
-    """Pick first existing column (case-insensitive) from candidates."""
+    """First existing column (case-insensitive) from candidates."""
     for c in candidates:
-        got = cols.get(c.lower())
-        if got:
-            return got[0]
+        if c in cols:
+            return cols[c]
     if required:
-        raise ValueError(f"Could not find any of columns: {candidates}")
+        raise ValidationError(f"Could not find any of columns: {candidates}")
     return None
 
-def _detect_finance_columns(table_fq: str):
-    """
-    Infer department, amount, date, expense_type column names from the table.
-    Extend candidate lists if needed to match your data.
-    """
-    cols = _table_schema_cols(table_fq)
 
-    department = _pick_column(cols, ["department", "dept", "cost_center", "costcentre", "cost_centre"])
-    amount     = _pick_column(cols, ["amount", "total_amount", "spend", "cost", "value", "amt"])
-    date       = _pick_column(cols, ["date", "txn_date", "transaction_date", "post_date", "doc_date", "month", "period"])
-    expense    = _pick_column(cols, ["expense_type", "category", "type", "gl_code"], required=False)
-
+def _detect_finance_columns(table_fq: str) -> dict:
+    """Map report roles to real column names. Names come from the table schema,
+    never from the request, so they are safe to interpolate."""
+    cols = {f.name.lower(): f.name for f in bq().get_table(table_fq).schema}
     return {
-        "department": department,
-        "amount": amount,
-        "date": date,
-        "expense_type": expense,  # may be None
+        "department": _pick_column(cols, ["department", "dept", "cost_center", "costcentre", "cost_centre"]),
+        "amount": _pick_column(cols, ["amount", "total_amount", "spend", "cost", "value", "amt"]),
+        "date": _pick_column(
+            cols, ["date", "txn_date", "transaction_date", "post_date", "doc_date", "month", "period"]
+        ),
+        "expense_type": _pick_column(cols, ["expense_type", "category", "type", "gl_code"], required=False),
     }
 
-# ===============================
-# 📊 Prebuilt Finance Reports (templated)
-# ===============================
+
 REPORTS = {
     "dept_totals": {
-        "label": "Total spend per department (6 months)",
+        "label": "Total spend per department",
         "sql": """
-        SELECT {department} AS department, SUM({amount}) AS total_spent
+        SELECT `{department}` AS department, SUM(`{amount}`) AS total_spent
         FROM `{table_fq}`
         GROUP BY department
         ORDER BY total_spent DESC
-        """
+        """,
     },
     "monthly_trend": {
         "label": "Monthly spend trend",
         "sql": """
-        SELECT FORMAT_DATE('%Y-%m', DATE({date})) AS month,
-               SUM({amount}) AS total_spent
+        SELECT FORMAT_DATE('%Y-%m', DATE(`{date}`)) AS month, SUM(`{amount}`) AS total_spent
         FROM `{table_fq}`
         GROUP BY month
         ORDER BY month
-        """
+        """,
     },
     "top_expense_types": {
         "label": "Top 5 expense categories",
         "sql": """
-        SELECT {expense_type} AS expense_type, SUM({amount}) AS total_spent
+        SELECT {expense_type} AS expense_type, SUM(`{amount}`) AS total_spent
         FROM `{table_fq}`
         GROUP BY expense_type
         ORDER BY total_spent DESC
         LIMIT 5
-        """
+        """,
     },
     "dept_month_matrix": {
         "label": "Department spend by month",
         "sql": """
-        SELECT FORMAT_DATE('%Y-%m', DATE({date})) AS month,
-               {department} AS department,
-               SUM({amount}) AS total_spent
+        SELECT FORMAT_DATE('%Y-%m', DATE(`{date}`)) AS month,
+               `{department}` AS department,
+               SUM(`{amount}`) AS total_spent
         FROM `{table_fq}`
         GROUP BY month, department
         ORDER BY month, department
-        """
+        """,
     },
     "avg_monthly_by_dept": {
         "label": "Average monthly spend per department",
         "sql": """
         WITH monthly AS (
-          SELECT {department} AS department,
-                 FORMAT_DATE('%Y-%m', DATE({date})) AS month,
-                 SUM({amount}) AS monthly_spent
+          SELECT `{department}` AS department,
+                 FORMAT_DATE('%Y-%m', DATE(`{date}`)) AS month,
+                 SUM(`{amount}`) AS monthly_spent
           FROM `{table_fq}`
           GROUP BY department, month
         )
@@ -314,329 +316,124 @@ REPORTS = {
         FROM monthly
         GROUP BY department
         ORDER BY avg_monthly_spent DESC
-        """
+        """,
     },
 }
 
-def _run_sql(sql: str, max_rows: int = 1000):
-    job = bq_client.query(sql)
-    result = job.result(max_results=max_rows)
-    columns = [f.name for f in result.schema]
-    rows = [list(row.values()) for row in result]
-    return columns, rows
 
-# ===============================
-# 🔹 Looker Studio publishing helpers (views in BigQuery)
-# ===============================
-def _create_or_replace_view(view_id: str, sql: str):
-    """
-    Create or replace a standard BigQuery view.
-    view_id must be like: PROJECT.DATASET.VIEW_NAME
-    """
-    try:
-        existing = bq_client.get_table(view_id)
-        existing.view_query = sql
-        bq_client.update_table(existing, ["view_query"])
-        return existing
-    except NotFound:
-        table = bigquery.Table(view_id)
-        table.view_query = sql
-        return bq_client.create_table(table)
-
-def publish_looker_views_for_table(table_name: str) -> dict:
-    """
-    For each REPORT in REPORTS, create a view named:
-      <table>__<report_id>_v  (e.g., finance_data__dept_totals_v)
-    Returns dict {report_id: fully_qualified_view_id}
-    """
-    ensure_dataset_exists(BIGQUERY_DATASET)
-    validated_table_name = validate_table_name(table_name)
-
-    table_fq = f"{PROJECT_ID}.{BIGQUERY_DATASET}.{validated_table_name}"
+def render_report_sql(report_id: str, table_name: str) -> str:
+    table_fq = f"{PROJECT_ID}.{BIGQUERY_DATASET}.{validate_table_name(table_name)}"
     cols = _detect_finance_columns(table_fq)
+    return REPORTS[report_id]["sql"].format(
+        table_fq=table_fq,
+        department=cols["department"],
+        amount=cols["amount"],
+        date=cols["date"],
+        expense_type=f"`{cols['expense_type']}`" if cols["expense_type"] else "NULL",
+    )
 
-    created = {}
-    for rid, meta in REPORTS.items():
-        view_name = f"{validated_table_name}__{rid}_v"
-        view_fq = f"{PROJECT_ID}.{BIGQUERY_DATASET}.{view_name}"
-        sql = meta["sql"].format(
-            table_fq=table_fq,
-            department=cols["department"],
-            amount=cols["amount"],
-            date=cols["date"],
-            expense_type=cols["expense_type"] or "NULL",
-        )
-        _create_or_replace_view(view_fq, sql)
-        created[rid] = view_fq
-
-    return created
-
-# ===============================
-# 🔹 Routes (IAP-protected)
-# ===============================
-@app.route('/', methods=['GET', 'POST'])
-@require_user
-@rate_limit(max_requests=5, window_seconds=60)  # Limit to 5 uploads per minute per user
-def index():
-    user_email = current_user_email()
-    logger.info(f"Request from user: {user_email}")
-
-    if request.method == 'POST':
-        uploaded_file = request.files.get('file')
-        if not uploaded_file:
-            return jsonify({"success": False, "error": "No file uploaded"}), 400
-            
-        if uploaded_file.filename == '':
-            return jsonify({"success": False, "error": "No file selected"}), 400
-
-        file_ext = os.path.splitext(uploaded_file.filename)[1].lower()
-        file_path = f"/tmp/{uploaded_file.filename}"
-        
-        try:
-            uploaded_file.save(file_path)
-            logger.info(f"File saved: {uploaded_file.filename}")
-
-            table_name = os.path.splitext(uploaded_file.filename)[0].replace(" ", "_").lower()
-            table_name = validate_table_name(table_name)  # Validate table name
-            
-            logger.info(f"Processing file: {uploaded_file.filename}, table: {table_name}")
-
-            if file_ext == '.sql':
-                # Upload raw SQL to GCS then notify Pub/Sub
-                bucket = storage_client.bucket(BUCKET_NAME)
-                blob = bucket.blob(f"uploads/{uploaded_file.filename}")
-                blob.upload_from_filename(file_path)
-                logger.info(f"SQL file uploaded to GCS: {uploaded_file.filename}")
-
-                message_data = {'name': uploaded_file.filename, 'bucket': BUCKET_NAME}
-                publisher.publish(topic_path, data=json.dumps(message_data).encode('utf-8'))
-                logger.info(f"Pub/Sub message published for SQL file: {uploaded_file.filename}")
-
-            elif file_ext in ['.xlsx', '.xls']:
-                # Convert Excel to CSV first
-                csv_path = f"/tmp/{table_name}.csv"
-                df = pd.read_excel(file_path)
-                df.to_csv(csv_path, index=False)
-                logger.info(f"Excel file converted to CSV: {uploaded_file.filename}")
-                load_to_bigquery(csv_path, f"{table_name}.csv", table_name)
-
-            elif file_ext in ['.csv', '.json', '.parquet']:
-                load_to_bigquery(file_path, uploaded_file.filename, table_name)
-
-            else:
-                return jsonify({"success": False, "error": "Unsupported file format. Supported: CSV, Excel, JSON, Parquet, SQL"}), 400
-
-            # Run downstream analysis
-            analysis_result = run_analysis(table_name)
-            logger.info(f"Analysis completed for table: {table_name}")
-            
-            return jsonify({
-                "success": True,
-                "message": f"✅ Uploaded {uploaded_file.filename} and analysis complete",
-                "table": table_name,
-                "user": user_email
-            })
-
-        except ValueError as ve:
-            logger.error(f"Validation error for {uploaded_file.filename}: {str(ve)}")
-            return jsonify({"success": False, "error": str(ve)}), 400
-        except Exception as e:
-            logger.error(f"Error processing {uploaded_file.filename}: {str(e)}", exc_info=True)
-            return jsonify({"success": False, "error": f"Error processing file: {str(e)}"}), 500
-        finally:
-            # Clean up temporary files
-            try:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                csv_path = f"/tmp/{table_name}.csv"
-                if os.path.exists(csv_path):
-                    os.remove(csv_path)
-            except Exception as cleanup_error:
-                logger.warning(f"Error cleaning up temporary files: {cleanup_error}")
-
-    return render_template('index.html')
-
-@app.route('/download/<filename>')
-@require_user
-def download_file(filename):
-    bucket = storage_client.bucket(BUCKET_NAME)
-    blob = bucket.blob(f"analysis_results/{filename}")
-
-    if not blob.exists():
-        return f"File {filename} not found in analysis_results folder.", 404
-
-    temp_path = f"/tmp/{filename}"
-    blob.download_to_filename(temp_path)
-    return send_file(temp_path, mimetype='text/csv', as_attachment=True, download_name=filename)
-
-@app.route('/download_bq')
-@require_user
-def download_bq():
-    table_name = request.args.get("table")
-    if not table_name:
-        return "Missing ?table parameter.", 400
-
-    try:
-        run_analysis(table_name)
-    except ValueError as e:
-        return str(e), 400
-
-    query = f"SELECT * FROM `{PROJECT_ID}.{BIGQUERY_DATASET}.{table_name}_analysis`"
-    results = bq_client.query(query).result()
-
-    temp_path = f"/tmp/{table_name}_analysis.csv"
-    with open(temp_path, "w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.writer(csvfile)
-        headers = [field.name for field in results.schema]
-        writer.writerow(headers)
-        for row in results:
-            writer.writerow(list(row.values()))
-
-    return send_file(temp_path, mimetype='text/csv', as_attachment=True, download_name=f"{table_name}_analysis.csv")
-
-@app.route("/whoami")
-@require_user
-def whoami():
-    """Return the IAP-authenticated user's email."""
-    return jsonify({"success": True, "email": current_user_email()})
-
-# (optional) simple health endpoint without auth (keep if you want LB checks)
-@app.route("/healthz")
-def healthz():
-    return "ok", 200
 
 @app.route("/reports")
 @require_user
 def list_reports():
-    """Return the list of available report ids + labels."""
-    items = [{"id": k, "label": v["label"]} for k, v in REPORTS.items()]
-    return jsonify({"reports": items})
+    return jsonify({"reports": [{"id": k, "label": v["label"]} for k, v in REPORTS.items()]})
+
 
 @app.route("/run_report", methods=["POST"])
 @require_user
+@rate_limit()
 def run_report():
-    """
-    Body JSON: { "report": "<id from /reports>", "table": "<your_table>", "limit": 1000? }
-    Returns: { columns: [...], rows: [[...]], row_count: N }
-    """
+    """Body: {"report": "<id>", "table": "<table>", "limit": 1000}"""
     data = request.get_json(silent=True) or {}
     report_id = data.get("report")
-    table = data.get("table")
-    limit = int(data.get("limit") or 1000)
-
     if report_id not in REPORTS:
         return jsonify({"success": False, "error": "Unknown report id."}), 400
-    if not table:
-        return jsonify({"success": False, "error": "Missing 'table'."}), 400
-
     try:
-        table_fq = _fq_table(table)
-        cols = _detect_finance_columns(table_fq)
-        sql = REPORTS[report_id]["sql"].format(
-            table_fq=table_fq,
-            department=cols["department"],
-            amount=cols["amount"],
-            date=cols["date"],
-            expense_type=cols["expense_type"] or "NULL",
-        )
-        columns, rows = _run_sql(sql, max_rows=limit)
-        return jsonify({
-            "success": True,
-            "columns": columns,
-            "rows": rows,
-            "row_count": len(rows)
-        })
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        limit = min(max(int(data.get("limit") or 1000), 1), 10_000)
+        sql = render_report_sql(report_id, data.get("table") or "")
+        with metrics.BQ_QUERY_LATENCY.labels(report_id).time():
+            result = bq().query(sql).result(max_results=limit)
+    except (ValidationError, ValueError) as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except NotFound:
+        return jsonify({"success": False, "error": "Table not found."}), 404
+    columns = [f.name for f in result.schema]
+    rows = [list(r.values()) for r in result]
+    return jsonify({"success": True, "columns": columns, "rows": rows, "row_count": len(rows)})
+
 
 @app.route("/download_report")
 @require_user
+@rate_limit()
 def download_report():
-    """
-    Query params: ?report=<id>&table=<table>
-    Streams a CSV file for the selected report.
-    """
     report_id = request.args.get("report")
-    table = request.args.get("table")
-    if report_id not in REPORTS or not table:
-        return "Missing or invalid parameters.", 400
-
+    table = request.args.get("table", "")
+    if report_id not in REPORTS:
+        return "Unknown report id.", 400
     try:
-        table_fq = _fq_table(table)
-        cols = _detect_finance_columns(table_fq)
-        sql = REPORTS[report_id]["sql"].format(
-            table_fq=table_fq,
-            department=cols["department"],
-            amount=cols["amount"],
-            date=cols["date"],
-            expense_type=cols["expense_type"] or "NULL",
-        )
-        job = bq_client.query(sql)
-        result = job.result()
+        sql = render_report_sql(report_id, table)
+        return _csv_response(bq().query(sql).result(), f"{report_id}_{table}.csv")
+    except ValidationError as e:
+        return str(e), 400
+    except NotFound:
+        return "Table not found.", 404
 
-        out = io.StringIO()
-        writer = csv.writer(out)
-        columns = [f.name for f in result.schema]
-        writer.writerow(columns)
-        for row in result:
-            writer.writerow(list(row.values()))
-        out.seek(0)
 
-        return send_file(
-            io.BytesIO(out.read().encode("utf-8")),
-            mimetype="text/csv",
-            as_attachment=True,
-            download_name=f"{report_id}_{table}.csv"
-        )
-    except Exception as e:
-        return f"Error: {e}", 500
+# ===============================
+# Looker Studio: one BigQuery view per report
+# ===============================
+def _create_or_replace_view(view_id: str, sql: str):
+    try:
+        existing = bq().get_table(view_id)
+        existing.view_query = sql
+        bq().update_table(existing, ["view_query"])
+    except NotFound:
+        view = bigquery.Table(view_id)
+        view.view_query = sql
+        bq().create_table(view)
+
+
+def publish_looker_views_for_table(table_name: str) -> dict:
+    """Create/replace views named <table>__<report_id>_v for Looker Studio to connect to."""
+    table_name = validate_table_name(table_name)
+    created = {}
+    for rid in REPORTS:
+        view_fq = f"{PROJECT_ID}.{BIGQUERY_DATASET}.{table_name}__{rid}_v"
+        _create_or_replace_view(view_fq, render_report_sql(rid, table_name))
+        created[rid] = view_fq
+    return created
+
 
 @app.route("/publish_looker_views", methods=["POST"])
 @require_user
+@rate_limit()
 def publish_looker_views():
-    """
-    Body JSON: { "table": "finance_data" }
-    Creates/updates one view per prebuilt report, e.g.:
-      data-analysis-webapp.analysis_dataset.finance_data__dept_totals_v
-    Returns JSON listing the view IDs you can pick in Looker Studio.
-    """
-    data = request.get_json(silent=True) or {}
-    table = data.get("table")
-    if not table:
-        return jsonify({"success": False, "error": "Missing 'table'."}), 400
+    table = (request.get_json(silent=True) or {}).get("table", "")
     try:
-        views = publish_looker_views_for_table(table)
-        return jsonify({"success": True, "views": views})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": True, "views": publish_looker_views_for_table(table)})
+    except ValidationError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except NotFound:
+        return jsonify({"success": False, "error": "Table not found."}), 404
+
 
 @app.route("/looker_help")
 @require_user
 def looker_help():
-    """
-    Returns the project/dataset and a short how-to for Looker Studio.
-    """
     return jsonify({
         "success": True,
         "project_id": PROJECT_ID,
         "dataset": BIGQUERY_DATASET,
         "how_to": [
-            "Open https://lookerstudio.google.com → Create → Report.",
-            "Add data → BigQuery connector.",
-            f"Pick project '{PROJECT_ID}' → dataset '{BIGQUERY_DATASET}'.",
-            "Choose any of the *_v views you created (e.g. finance_data__dept_totals_v).",
-            "Click CONNECT, then add charts (bar/line/pie) as needed."
+            "Open https://lookerstudio.google.com -> Create -> Report.",
+            "Add data -> BigQuery connector.",
+            f"Pick project '{PROJECT_ID}' -> dataset '{BIGQUERY_DATASET}'.",
+            "Choose one of the *_v views (e.g. finance_data__dept_totals_v).",
+            "Click CONNECT, then add charts.",
         ],
-        "tip": "Re-run /publish_looker_views after uploading a new base table name."
+        "tip": "Re-run Publish after uploading a table under a new name.",
     })
 
-# ===============================
-# 🔹 Start Flask App
-# ===============================
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
 
-
-
-
-
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))

@@ -1,69 +1,28 @@
-name: Deploy to Cloud Run and Cloud Functions
+name: Deploy
 
+# Manual only: deploying needs a GCP project with create_resources.sh already run.
+# Required repo settings:
+#   Variables: PROJECT_ID (and optionally REGION)
+#   Secrets:   GCP_SA_KEY (JSON key for a deployer service account)
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
-env:
-  PROJECT_ID: project-64f58cb2-a1cc-4618-9a0
-  REGION: asia-southeast1
-  SERVICE_NAME: data-analysis-webapp
-  REPO_NAME: cloud-run-repo
-  IMAGE_NAME: webapp
-  FUNCTION_NAME: run_analysis
-  FUNCTION_PATH: functions/run_analysis
-  # Use the same runtime SA you used previously on Cloud Run
-  RUNTIME_SA: github-developer@project-64f58cb2-a1cc-4618-9a0.iam.gserviceaccount.com
+permissions:
+  contents: read
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
+    env:
+      PROJECT_ID: ${{ vars.PROJECT_ID }}
+      REGION: ${{ vars.REGION || 'asia-southeast1' }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - name: Set up gcloud SDK
-        uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/setup-gcloud@v2
         with:
-          project_id: ${{ env.PROJECT_ID }}
-
-      - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
-
-      - name: Build and push Docker image
-        run: |
-          IMAGE_URI=${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO_NAME }}/${{ env.IMAGE_NAME }}:${GITHUB_SHA}
-          docker build -f webapp/Dockerfile -t $IMAGE_URI ./webapp
-          docker push $IMAGE_URI
-          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
-
-      - name: Deploy to Cloud Run (private behind IAP/LB)
-        run: |
-          gcloud run deploy ${{ env.SERVICE_NAME }} \
-            --image "$IMAGE_URI" \
-            --region ${{ env.REGION }} \
-            --platform managed \
-            --service-account "${{ env.RUNTIME_SA }}" \
-            --ingress=internal-and-cloud-load-balancing \
-            --set-env-vars=GCP_PROJECT=${{ env.PROJECT_ID }},BUCKET_NAME=project-64f58cb2-data-analysis,PUBSUB_TOPIC_FOR_SQL_IMPORT=sql-import-topic,BIGQUERY_DATASET=analysis_dataset
-
-      # Optional: keep this if you really want the function public via HTTP.
-      # If you'd prefer private, remove --allow-unauthenticated and protect it with IAP or a signed IAP JWT flow.
-      - name: Deploy Cloud Function run_analysis
-        run: |
-          gcloud functions deploy ${{ env.FUNCTION_NAME }} \
-            --gen2 \
-            --runtime python311 \
-            --trigger-http \
-            --allow-unauthenticated \
-            --region ${{ env.REGION }} \
-            --source "${{ env.FUNCTION_PATH }}" \
-            --entry-point run_analysis \
-            --set-env-vars "GCP_PROJECT=${{ env.PROJECT_ID }},BIGQUERY_DATASET=analysis_dataset,BUCKET_NAME=project-64f58cb2-data-analysis"
+          project_id: ${{ vars.PROJECT_ID }}
+          install_components: beta
+      - run: ./deployment/deploy.sh
