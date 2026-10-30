@@ -1,0 +1,37 @@
+# Demo with no GCP account: uploads go to a local fake Cloud Storage server.
+# Upload validation, rate limiting and metrics are real. Pub/Sub, the ingest
+# function and BigQuery are not running, so files stop at storage and report
+# endpoints return errors. Add the monitoring overlay for Grafana:
+#
+#   docker compose -f docker-compose.demo.yml -f docker-compose.monitoring.yml up -d --build
+#   python scripts/generate_traffic.py --minutes 3 --skip-status
+services:
+  webapp:
+    build: ./webapp
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      GCP_PROJECT: demo-project
+      BUCKET_NAME: demo-bucket
+      DEV_USER_EMAIL: demo@example.com
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_EMULATOR_HOST: http://fake-gcs:4443
+    depends_on:
+      - redis
+      - fake-gcs
+
+  fake-gcs:
+    image: fsouza/fake-gcs-server:1.49
+    command: ["-scheme", "http", "-port", "4443", "-backend", "memory", "-external-url", "http://fake-gcs:4443"]
+
+  # The fake server starts empty, so create the bucket once it is up.
+  create-bucket:
+    image: curlimages/curl:8.10.1
+    command: ["--retry", "15", "--retry-connrefused", "--retry-delay", "1", "-fsS",
+              "-H", "Content-Type: application/json", "-d", "{\"name\": \"demo-bucket\"}",
+              "http://fake-gcs:4443/storage/v1/b"]
+    depends_on:
+      - fake-gcs
+
+  redis:
+    image: redis:7-alpine

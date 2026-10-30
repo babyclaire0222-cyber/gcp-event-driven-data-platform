@@ -47,6 +47,7 @@ def main():
     ap.add_argument("--url", default="http://localhost:8080")
     ap.add_argument("--minutes", type=float, default=3)
     ap.add_argument("--good-ratio", type=float, default=0.6, help="share of uploads that are valid")
+    ap.add_argument("--skip-status", action="store_true", help="skip BigQuery status polls (no-GCP demo)")
     args = ap.parse_args()
     if not args.url.startswith(("http://", "https://")):
         ap.error("--url must be http(s)")
@@ -58,7 +59,7 @@ def main():
         roll = random.random()  # noqa: S311 (not crypto)
         if roll < 0.3:
             status = request(args.url, "GET", "/healthz")
-        elif roll < 0.6:
+        elif roll < 0.6 and not args.skip_status:
             status = request(args.url, "GET", "/status/finance_6months")
         elif random.random() < args.good_ratio:  # noqa: S311
             status = upload(args.url, "finance_6months.csv", good)

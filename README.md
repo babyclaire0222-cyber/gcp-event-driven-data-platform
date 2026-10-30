@@ -4,6 +4,8 @@
 
 A serverless GCP pipeline for finance and ops analysts. Upload a CSV, JSON, Parquet, Excel or delimited text file, and it's validated, loaded into BigQuery through Pub/Sub and Cloud Functions, and available as Looker Studio dashboards within seconds. No data engineer needed.
 
+> **Project status:** the code is complete and tested locally: 71 unit tests, CI, Jenkins, and a Docker demo with Prometheus and Grafana. It has **not yet been run on live GCP**. The design below and the `deployment/` scripts are unverified against real Cloud Run, Pub/Sub, Cloud Functions, BigQuery and Looker Studio, because the project has no active billing account.
+
 ## Architecture
 
 ```mermaid
@@ -68,7 +70,14 @@ The web app never loads data itself. It writes the file to GCS and returns `202 
 
 ## Run locally
 
-Prerequisites: Docker, and the `gcloud` CLI logged in to a dev project where `create_resources.sh` has been run. The pipeline itself runs in GCP, so a local upload goes through the same Pub/Sub → function → BigQuery path as production.
+**Quick demo, no GCP account.** Uploads go to a local fake Cloud Storage server. Validation, rate limiting and metrics are real; Pub/Sub, the ingest function and BigQuery aren't running, so files stop at storage and the upload page stays on "still processing":
+
+```bash
+docker compose -f docker-compose.demo.yml -f docker-compose.monitoring.yml up -d --build
+python scripts/generate_traffic.py --minutes 3 --skip-status
+```
+
+**Full local run, with a GCP project.** Prerequisites: Docker, and the `gcloud` CLI logged in to a dev project where `create_resources.sh` has been run. The pipeline itself runs in GCP, so a local upload goes through the same Pub/Sub → function → BigQuery path as production.
 
 ```bash
 gcloud auth application-default login
@@ -111,6 +120,8 @@ ruff check . && pytest
 Try `sample_data/finance_6months.csv` (loads and powers the reports) and `sample_data/bad_rows.json` (passes the web app's first-line check, then BigQuery rejects it and it shows up as `rejected` with the reason).
 
 ## Deploy
+
+Not yet run against a live project (see project status). The steps below describe what the scripts are written to do.
 
 ```bash
 export PROJECT_ID=your-project IAP_USER=you@gmail.com
@@ -157,15 +168,7 @@ This deletes the Cloud Run service, the function (and its Eventarc trigger), the
 
 ## Screenshots
 
-**Looker Studio dashboard** built on the `finance_6months__*_v` views:
-
-![Looker Studio dashboard](docs/screenshots/looker-dashboard.png)
-
-**BigQuery query** against the loaded table:
-
-![BigQuery query result](docs/screenshots/bigquery-query.png)
-
-**Grafana**, the *Webapp overview* dashboard during `generate_traffic.py`:
+**Grafana**, the *Webapp overview* dashboard during the local demo with `generate_traffic.py`:
 
 ![Grafana dashboard](docs/screenshots/grafana-dashboard.png)
 
@@ -175,9 +178,10 @@ This deletes the Cloud Run service, the function (and its Eventarc trigger), the
 
 ## What I'd do next
 
-1. **Shared rate limiting in production.** The deployed Cloud Run service has no Redis, so limits apply per instance. With `--max-instances=3`, one user could in theory make 3× the configured limit. The fix is to point `REDIS_URL` at Memorystore through a VPC connector, which I skipped to keep the demo under $1/month.
-2. **Verify the IAP JWT in the app.** The app trusts `X-Goog-Authenticated-User-Email` because the service only accepts traffic through IAP. Checking the signed `X-Goog-IAP-JWT-Assertion` would protect against a future misconfiguration, such as someone adding `--allow-unauthenticated`.
-3. **Production observability and hardening.** Items still missing:
+1. **Run it on live GCP.** Deploy with `create_resources.sh`, confirm the full upload → BigQuery path, and add Looker Studio and BigQuery screenshots.
+2. **Shared rate limiting in production.** The deployed Cloud Run service has no Redis, so limits apply per instance. With `--max-instances=3`, one user could in theory make 3× the configured limit. The fix is to point `REDIS_URL` at Memorystore through a VPC connector, which I skipped to keep the demo under $1/month.
+3. **Verify the IAP JWT in the app.** The app trusts `X-Goog-Authenticated-User-Email` because the service only accepts traffic through IAP. Checking the signed `X-Goog-IAP-JWT-Assertion` would protect against a future misconfiguration, such as someone adding `--allow-unauthenticated`.
+4. **Production observability and hardening.** Items still missing:
    - Prometheus and Grafana run with Docker Compose only; nothing scrapes the deployed Cloud Run service yet. The next step is Google Cloud Managed Service for Prometheus with a Cloud Run sidecar, and Alertmanager routing to email or Slack (right now the rules only show in the Prometheus UI).
    - The ingest function has no Prometheus metrics; its health is visible only in Cloud Logging.
    - a dead-letter topic for messages that keep failing
